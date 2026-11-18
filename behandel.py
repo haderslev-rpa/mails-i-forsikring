@@ -348,59 +348,202 @@ async def _hent_eller_beregn_identifikator(
     return identifikator
 
 async def _gem_digitalpost_oplysninger(
-    item: Any, box_data: dict[str, Any], mail_id: str
+    item: Any,
+    box_data: dict[str, Any],
+    mail_id: str,
 ) -> None:
-    """Læs kun maindoc.pdf og gem nummerplade og entydigt Insubiz-match."""
+    """Læs maindoc.pdf og find køretøjet via nummerplade, stelnummer eller begge."""
     identifikator = box_data[config.BOX_KEY_IDENTIFIER]
-    nummer = identifikator.get(config.BOX_KEY_IDENTIFIER_VALUE)
-    if not (identifikator.get(config.BOX_KEY_IDENTIFIER_TYPE) == "nummerplade"
-            and isinstance(nummer, str) and re.fullmatch(r"[A-Z0-9]{7}", nummer)):
-        pdf_filer = await outlook_service.hent_pdf_vedhaeftninger(mail_id=mail_id)
-        maindoc = [pdf for pdf in pdf_filer
-                   if str(pdf.get("name", "")).strip().casefold() == "maindoc.pdf"]
+    nummerplade = _normaliser_valgfri_tekst(
+        identifikator.get(config.BOX_KEY_REGISTRATION)
+    )
+    stelnummer = _normaliser_valgfri_tekst(
+        identifikator.get(config.BOX_KEY_CHASSIS_NUMBER)
+    )
+
+    if not nummerplade and not stelnummer:
+        pdf_filer = await outlook_service.hent_pdf_vedhaeftninger(
+            mail_id=mail_id
+        )
+        maindoc = [
+            pdf
+            for pdf in pdf_filer
+            if str(pdf.get("name", "")).strip().casefold()
+            == "maindoc.pdf"
+        ]
         if len(maindoc) != 1:
             raise Forretningsfejl("Forventede præcis én maindoc.pdf.")
-        nummer = _laes_digitalpost_nummer(maindoc[0]["content"])
+
+        fundne = _laes_digitalpost_identifikatorer(maindoc[0]["content"])
+        nummerplade = fundne.get("nummerplade")
+        stelnummer = fundne.get("stelnummer")
+
+        primartype = "nummerplade" if nummerplade else "stelnummer"
+        primaervaerdi = nummerplade or stelnummer
         box_data[config.BOX_KEY_IDENTIFIER] = {
-            config.BOX_KEY_IDENTIFIER_TYPE: "nummerplade",
-            config.BOX_KEY_IDENTIFIER_VALUE: nummer,
+            config.BOX_KEY_IDENTIFIER_TYPE: primartype,
+            config.BOX_KEY_IDENTIFIER_VALUE: primaervaerdi,
+            config.BOX_KEY_REGISTRATION: nummerplade,
+            config.BOX_KEY_CHASSIS_NUMBER: stelnummer,
             config.BOX_KEY_ATTACHMENT_NAME: maindoc[0]["name"],
         }
         await _gem_box_data(item, box_data)
 
-    if box_data[config.BOX_KEY_VEHICLE].get(config.BOX_KEY_VEHICLE_FOUND):
+    if box_data[config.BOX_KEY_VEHICLE].get(
+        config.BOX_KEY_VEHICLE_FOUND
+    ):
         return
+
     koeretoejer = await _hent_koeretoejer()
-    try:
-        koeretoej = _find_koeretoej(
-            koeretoejer=koeretoejer,
-            identifikator={"type": "nummerplade", "vaerdi": nummer},
-        )
-    except Exception as error:
-        raise Forretningsfejl("Intet entydigt køretøj i Insubiz.") from error
-    if not koeretoej.get("fundet"):
-        raise Forretningsfejl("Køretøjet blev ikke fundet i Insubiz.")
+    koeretoej = _find_digitalpost_koeretoej(
+        koeretoejer=koeretoejer,
+        nummerplade=nummerplade,
+        stelnummer=stelnummer,
+    )
     _gem_koeretoej_i_box(box_data, koeretoej)
     await _gem_box_data(item, box_data)
 
-def _laes_digitalpost_nummer(content: bytes) -> str:
-    """Kræv ét entydigt syvtegns registreringsnummer i PDF-tekstlaget."""
+
+def _laes_digitalpost_identifikatorer(content: bytes) -> dict[str, str | None]:
+    """Udtræk højst ét registreringsnummer og højst ét stelnummer fra PDF'en."""
     if not isinstance(content, bytes) or not content.startswith(b"%PDF-"):
-        raise Forretningsfejl("maindoc.pdf indeholder ikke gyldige PDF-bytes.")
+        raise Forretningsfejl(
+            "maindoc.pdf indeholder ikke gyldige PDF-bytes."
+        )
     try:
-        tekst = "\n".join(page.extract_text() or ""
-                          for page in PdfReader(io.BytesIO(content)).pages)
+        tekst = "\n".join(
+            page.extract_text() or ""
+            for page in PdfReader(io.BytesIO(content)).pages
+        )
     except Exception as error:
         raise Forretningsfejl("maindoc.pdf kunne ikke læses.") from error
-    numre = {m.group(1).upper() for m in re.finditer(
-        r"Registreringsnummer\s*:\s*([A-Z0-9]{7})(?![A-Z0-9])",
-        tekst, flags=re.IGNORECASE,
-    )}
-    if len(numre) != 1:
-        raise Forretningsfejl(
-            "maindoc.pdf skal indeholde ét entydigt registreringsnummer."
+
+    nummerplader = {
+        _normaliser_koeretoejsidentifikator(match.group(1))
+        for match in re.finditer(
+            r"(?:Registreringsnummer|Registreringsnr|Reg\.?\s*nr\.?)"
+            r"\s*:\s*([A-Z0-9][A-Z0-9 -]{3,10}[A-Z0-9])",
+            tekst,
+            flags=re.IGNORECASE,
         )
-    return numre.pop()
+    }
+    nummerplader = {
+        value
+        for value in nummerplader
+        if re.fullmatch(config.REGISTRATION_PATTERN, value)
+    }
+
+    stelnumre = {
+        _normaliser_koeretoejsidentifikator(match.group(1))
+        for match in re.finditer(
+            r"(?:Stelnummer|Stelnr\.?|Stel\s*nr\.?|VIN)"
+            r"\s*:\s*([A-HJ-NPR-Z0-9]{17})",
+            tekst,
+            flags=re.IGNORECASE,
+        )
+    }
+    stelnumre = {
+        value
+        for value in stelnumre
+        if re.fullmatch(config.VIN_PATTERN, value)
+    }
+
+    if len(nummerplader) > 1:
+        raise Forretningsfejl(
+            "maindoc.pdf indeholder flere forskellige registreringsnumre: "
+            + ", ".join(sorted(nummerplader))
+        )
+    if len(stelnumre) > 1:
+        raise Forretningsfejl(
+            "maindoc.pdf indeholder flere forskellige stelnumre: "
+            + ", ".join(sorted(stelnumre))
+        )
+    if not nummerplader and not stelnumre:
+        raise Forretningsfejl(
+            "maindoc.pdf indeholder hverken et entydigt "
+            "registreringsnummer eller stelnummer."
+        )
+
+    return {
+        "nummerplade": next(iter(nummerplader), None),
+        "stelnummer": next(iter(stelnumre), None),
+    }
+
+
+def _normaliser_koeretoejsidentifikator(value: str) -> str:
+    """Fjern mellemrum og bindestreger og anvend store bogstaver."""
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+def _find_digitalpost_koeretoej(
+    *,
+    koeretoejer: list[dict[str, Any]],
+    nummerplade: str | None,
+    stelnummer: str | None,
+) -> dict[str, Any]:
+    """Find ét køretøj via en eller begge identifikatorer."""
+    fundne: list[tuple[str, dict[str, Any]]] = []
+    fejl: list[str] = []
+
+    for identifikator_type, identifikator_vaerdi in (
+        ("nummerplade", nummerplade),
+        ("stelnummer", stelnummer),
+    ):
+        if not identifikator_vaerdi:
+            continue
+        try:
+            koeretoej = _find_koeretoej(
+                koeretoejer=koeretoejer,
+                identifikator={
+                    "type": identifikator_type,
+                    "vaerdi": identifikator_vaerdi,
+                },
+            )
+        except vehicle_matcher.KoeretoejIkkeFundetFejl:
+            fejl.append(
+                f"{identifikator_type}={identifikator_vaerdi} gav intet match"
+            )
+            continue
+        except vehicle_matcher.FlereKoeretoejerFundetFejl as error:
+            raise Forretningsfejl(
+                "Flere køretøjer i Insubiz matcher "
+                f"{identifikator_type}={identifikator_vaerdi}."
+            ) from error
+        fundne.append((identifikator_type, koeretoej))
+
+    if not fundne:
+        detalje = "; ".join(fejl) or "ingen identifikatorer kunne anvendes"
+        raise Forretningsfejl(
+            "Intet entydigt køretøj i Insubiz. " + detalje + "."
+        )
+
+    if len(fundne) == 2 and not _samme_koeretoej(
+        fundne[0][1],
+        fundne[1][1],
+    ):
+        raise Forretningsfejl(
+            "Registreringsnummer og stelnummer fra maindoc.pdf matcher "
+            "to forskellige køretøjer i Insubiz."
+        )
+
+    return fundne[0][1]
+
+
+def _samme_koeretoej(
+    foerste: Mapping[str, Any],
+    anden: Mapping[str, Any],
+) -> bool:
+    """Sammenlign køretøjer på normaliseret nummerplade og stelnummer."""
+    for felt in ("nummerplade", "stelnummer"):
+        foerste_vaerdi = _normaliser_valgfri_tekst(foerste.get(felt))
+        anden_vaerdi = _normaliser_valgfri_tekst(anden.get(felt))
+        if foerste_vaerdi and anden_vaerdi:
+            if (
+                _normaliser_koeretoejsidentifikator(foerste_vaerdi)
+                != _normaliser_koeretoejsidentifikator(anden_vaerdi)
+            ):
+                return False
+    return True
 
 async def _hent_koeretoejer() -> list[dict[str, Any]]:
     try:
@@ -449,14 +592,12 @@ async def _haandter_manuel_behandling(
     koeretoej = box_data.get(config.BOX_KEY_VEHICLE, {})
     if not isinstance(koeretoej, Mapping):
         koeretoej = {}
-
     nummerplade = _normaliser_valgfri_tekst(
         koeretoej.get(config.BOX_KEY_REGISTRATION)
     )
     stelnummer = _normaliser_valgfri_tekst(
         koeretoej.get(config.BOX_KEY_CHASSIS_NUMBER)
     )
-
     if not levering.get(config.BOX_KEY_MANUAL_EMAIL_SENT, False):
         sendt = await outlook_service.send_mail_til_forsikring(
             emne=beslutning.emne,
@@ -468,28 +609,12 @@ async def _haandter_manuel_behandling(
         if not sendt:
             raise Systemfejl(
                 "Outlook bekræftede ikke mailen om manuel behandling. "
-                f"Manuel-id: {beslutning.manuel_id}. "
-                f"Nummerplade: {nummerplade or 'Mangler'}. "
-                f"Stelnummer: {stelnummer or 'Mangler'}."
+                f"Manuel-id: {beslutning.manuel_id}."
             )
         levering[config.BOX_KEY_MANUAL_EMAIL_SENT] = True
         levering[config.BOX_KEY_MANUAL_EMAIL_SENT_AT] = _utc_now()
         levering[config.BOX_KEY_MANUAL_ID] = beslutning.manuel_id
         await _gem_box_data(item, box_data)
-        logger.info(
-            "Mail om manuel behandling blev sendt. "
-            "manuel_id=%s, nummerplade=%s, stelnummer=%s",
-            beslutning.manuel_id,
-            nummerplade or "Mangler",
-            stelnummer or "Mangler",
-        )
-    else:
-        logger.info(
-            "Mail om manuel behandling er allerede sendt. "
-            "Mailen sendes ikke igen. manuel_id=%s",
-            beslutning.manuel_id,
-        )
-
     await _afslut_item(
         item,
         status=config.STATUS_MANUAL,
@@ -499,8 +624,8 @@ async def _haandter_manuel_behandling(
         ),
     )
     logger.info(
-        "Item sendt til manuel behandling. "
-        "manuel_id=%s, emne=%s, nummerplade=%s, stelnummer=%s",
+        "Item sendt til manuel behandling. manuel_id=%s, emne=%s, "
+        "nummerplade=%s, stelnummer=%s",
         beslutning.manuel_id,
         beslutning.emne,
         nummerplade or "Mangler",
