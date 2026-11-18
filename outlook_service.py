@@ -358,8 +358,10 @@ async def send_mail_til_forsikring(
     emne: str,
     besked: str,
     manuel_id: int,
+    nummerplade: str | None = None,
+    stelnummer: str | None = None,
 ) -> bool:
-    """Sender en standardiseret mail om manuel behandling til Forsikring."""
+    """Send standardiseret mail med nummerplade og stelnummer til Forsikring."""
     if isinstance(manuel_id, bool) or not isinstance(manuel_id, int):
         raise TypeError("manuel_id skal være et heltal.")
     if manuel_id <= 0:
@@ -367,21 +369,43 @@ async def send_mail_til_forsikring(
 
     normalized_subject = _paakraevet_tekst(emne, "emne")
     normalized_message = _paakraevet_tekst(besked, "besked")
+    normalized_registration = str(nummerplade or "").strip() or "Mangler"
+    normalized_chassis_number = str(stelnummer or "").strip() or "Mangler"
+
     body_html = (
         f"<p><strong>Manuel ID:</strong> {manuel_id}</p>"
         f"<p>{html.escape(normalized_message)}</p>"
+        '<table style="border-collapse: collapse; margin-top: 16px;">'
+        "<tr>"
+        '<td style="padding: 4px 16px 4px 0;">'
+        "<strong>Nummerplade:</strong>"
+        "</td>"
+        '<td style="padding: 4px 0;">'
+        f"{html.escape(normalized_registration)}"
+        "</td>"
+        "</tr>"
+        "<tr>"
+        '<td style="padding: 4px 16px 4px 0;">'
+        "<strong>Stelnummer:</strong>"
+        "</td>"
+        '<td style="padding: 4px 0;">'
+        f"{html.escape(normalized_chassis_number)}"
+        "</td>"
+        "</tr>"
+        "</table>"
         "<p>Originalmailen er ikke flyttet eller slettet og skal "
         "behandles manuelt.</p>"
     )
-
     return await send_mail(
         recipient=config.FORSIKRINGSTEAM_EMAIL,
-        subject=f"[Manuel {manuel_id}] {normalized_subject}",
+        subject=(
+            f"[Manuel {manuel_id}] {normalized_subject} - "
+            f"{normalized_registration}"
+        ),
         body_html=body_html,
         attachments=None,
         save_to_sent_items=True,
     )
-
 
 async def send_manglende_afdelingsmail(
     *,

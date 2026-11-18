@@ -444,25 +444,51 @@ async def _haandter_manuel_behandling(
     box_data: dict[str, Any],
     beslutning: manuel_behandling.ManuelBehandling,
 ) -> dict[str, Any]:
-    """Sender én manuel mail, gemmer checkpoint og afslutter itemet manuelt."""
+    """Send én manuel mail med køretøjsdata og afslut itemet manuelt."""
     levering = box_data[config.BOX_KEY_DELIVERY]
+    koeretoej = box_data.get(config.BOX_KEY_VEHICLE, {})
+    if not isinstance(koeretoej, Mapping):
+        koeretoej = {}
+
+    nummerplade = _normaliser_valgfri_tekst(
+        koeretoej.get(config.BOX_KEY_REGISTRATION)
+    )
+    stelnummer = _normaliser_valgfri_tekst(
+        koeretoej.get(config.BOX_KEY_CHASSIS_NUMBER)
+    )
 
     if not levering.get(config.BOX_KEY_MANUAL_EMAIL_SENT, False):
         sendt = await outlook_service.send_mail_til_forsikring(
             emne=beslutning.emne,
             besked=beslutning.besked,
             manuel_id=int(beslutning.manuel_id),
+            nummerplade=nummerplade,
+            stelnummer=stelnummer,
         )
         if not sendt:
             raise Systemfejl(
                 "Outlook bekræftede ikke mailen om manuel behandling. "
-                f"Manuel-id: {beslutning.manuel_id}."
+                f"Manuel-id: {beslutning.manuel_id}. "
+                f"Nummerplade: {nummerplade or 'Mangler'}. "
+                f"Stelnummer: {stelnummer or 'Mangler'}."
             )
-
         levering[config.BOX_KEY_MANUAL_EMAIL_SENT] = True
         levering[config.BOX_KEY_MANUAL_EMAIL_SENT_AT] = _utc_now()
         levering[config.BOX_KEY_MANUAL_ID] = beslutning.manuel_id
         await _gem_box_data(item, box_data)
+        logger.info(
+            "Mail om manuel behandling blev sendt. "
+            "manuel_id=%s, nummerplade=%s, stelnummer=%s",
+            beslutning.manuel_id,
+            nummerplade or "Mangler",
+            stelnummer or "Mangler",
+        )
+    else:
+        logger.info(
+            "Mail om manuel behandling er allerede sendt. "
+            "Mailen sendes ikke igen. manuel_id=%s",
+            beslutning.manuel_id,
+        )
 
     await _afslut_item(
         item,
@@ -472,11 +498,13 @@ async def _haandter_manuel_behandling(
             f"{beslutning.manuel_id}: {beslutning.emne}"
         ),
     )
-
     logger.info(
-        "Item sendt til manuel behandling. manuel_id=%s, emne=%s",
+        "Item sendt til manuel behandling. "
+        "manuel_id=%s, emne=%s, nummerplade=%s, stelnummer=%s",
         beslutning.manuel_id,
         beslutning.emne,
+        nummerplade or "Mangler",
+        stelnummer or "Mangler",
     )
     return box_data
 
